@@ -179,11 +179,11 @@
         let activeVideoId = null;
         let ws = null; 
         
-        // YENİ: Kullanıcı adını tarayıcı hafızasında tutuyoruz ki sekme kapanıp açılsa bile liderin kimliği(ismi) değişmesin
-        let myUsername = sessionStorage.getItem('rooms_username');
+        // YENİ: Kullanıcı adını tarayıcıda kalıcı tutuyoruz (Sekme/tarayıcı kapansa bile değişmez)
+        let myUsername = localStorage.getItem('rooms_username');
         if (!myUsername) {
             myUsername = "User-" + Math.floor(1000 + Math.random() * 9000);
-            sessionStorage.setItem('rooms_username', myUsername);
+            localStorage.setItem('rooms_username', myUsername);
         }
         
         let remoteLockUntil = 0; 
@@ -233,10 +233,10 @@
             handleIncomingRoomLink();
         };
 
-        // YENİ: Sekme kapatıldığında veya sayfa yenilendiğinde sunucuya anında "Çıktı" bilgisini ulaştır
-        window.addEventListener('beforeunload', () => {
+        // YENİ: Mobil ve Masaüstünde sekme/tarayıcı kapanmasını anında yakalayan kesin yöntem
+        window.addEventListener('pagehide', () => {
             if (ws) {
-                ws.onclose = null; // Yeniden bağlanmaya çalışmasını engelle
+                ws.onclose = null; 
                 ws.close();
             }
         });
@@ -348,17 +348,7 @@
             if(overlay) overlay.remove();
             
             setupRoomLayout(roomId, videoId, isHost);
-            
-            // YENİ: Liderin kendi 0:00 süresini başkalarına dayatmasını engellemek için 4 saniyelik "Sessizlik (Yayın) Kilidi"
-            remoteLockUntil = Date.now() + 4000;
-            
-            // Oynatıcı ve bağlantı hazır olur olmaz odadakilerden süreyi iste
-            let syncInterval = setInterval(() => {
-                if(ws && ws.readyState === WebSocket.OPEN && player && typeof player.getCurrentTime === 'function') {
-                    ws.send(JSON.stringify({ type: 'request_sync', sender: myUsername }));
-                    clearInterval(syncInterval);
-                }
-            }, 500);
+            // Erken sinyal kodu buradan tamamen silindi, çünkü YouTube henüz hazır değil!
         }
         function joinRoom(roomId, videoId) {
             const newStateUrl = buildRoomUrl(roomId, videoId);
@@ -386,25 +376,26 @@
         }
 
         function exitRoom() {
-            if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-                reconnectTimer = null;
-            }
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
             reconnectAttempts = 0;
             isHostSession = false;
-            currentRoomId = null; // YENİ: Arka planda hayalet gibi yeniden bağlanmayı engeller
+            currentRoomId = null;
 
             if (ws) {
-                ws.onclose = null; // YENİ: Otomatik bağlanma motorunu fişten çeker
-                ws.close();
+                ws.onclose = null; 
+                ws.close(); // Bağlantıyı anında koparır, sunucu anında haberdar olur
                 ws = null;
             }
             
             if (player && typeof player.stopVideo === 'function') {
-                player.stopVideo(); // YENİ: Videoyu sadece duraklatma, tamamen durdur ve kapat
+                player.stopVideo(); 
             }
             
-            goToLobby();
+            showScreen('lobbyScreen');
+            window.history.pushState({}, '', window.location.pathname);
+            refreshLobby(); 
+            setTimeout(refreshLobby, 500); 
+            setTimeout(refreshLobby, 1500); 
         }
 
         function handleSearchEnter(e) { if(e.key === 'Enter') performSearch(); }
@@ -537,10 +528,12 @@
                 playerVars: { 'playsinline': 1, 'rel': 0, 'controls': 1, 'origin': window.location.origin }, 
                 events: { 
                     'onReady': () => {
-                        // YouTube oynatıcı tam olarak hazırlandı!
-                        remoteLockUntil = Date.now() + 3000; 
+                        // YENİ: YouTube Oynatıcı tam olarak ekrana yüklendiğinde kilidi başlat!
+                        // Liderin 0:00'ı herkese yaymaması için 5 saniye boyunca kendisini susturuyoruz.
+                        remoteLockUntil = Date.now() + 5000; 
+                        
                         if (ws && ws.readyState === WebSocket.OPEN) {
-                            // Lider veya misafir fark etmez, oynatıcı hazır olunca odadakilerden süreyi iste
+                            // Şimdi güvenle odadakilerden gerçek saniyeyi isteyebiliriz
                             ws.send(JSON.stringify({ type: 'request_sync', sender: myUsername }));
                         }
                     },
