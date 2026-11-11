@@ -2,7 +2,8 @@
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#121212">
     <title>rOOms</title>
     <link rel="manifest" href="/manifest.json">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -85,6 +86,7 @@
         </div>
     </div>
 
+    <!-- VİDEO ARAMA VE LİNK YAPIŞTIRMA EKRANI -->
     <div id="searchScreen" class="flex flex-col flex-1 h-screen hidden bg-rooms-bg">
         <header class="flex items-center gap-3 px-4 py-4 border-b border-rooms-border bg-rooms-panel sticky top-0 z-20">
             <button onclick="goToLobby()" class="text-xl p-2 text-gray-400 active:text-white">←</button>
@@ -97,7 +99,7 @@
         <div id="searchResults" class="flex-1 overflow-y-auto p-4 space-y-3">
             <div class="h-full flex flex-col items-center justify-center text-gray-500 space-y-4 opacity-50">
                 <svg class="w-16 h-16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                <p class="text-sm font-medium">Başlamak için arama yapın</p>
+                <p class="text-sm font-medium">Başlamak için arama yapın veya link yapıştırın</p>
             </div>
         </div>
 
@@ -143,7 +145,6 @@
                     <span class="text-xs bg-rooms-accent/10 text-rooms-accent font-bold px-2.5 py-1 rounded-full border border-rooms-accent/20" id="roomIdText">ROOM-...</span>
                 </div>
                 <div class="flex items-center gap-3">
-                    <!-- KULLANICILAR BUTONU -->
                     <button onclick="toggleUserList()" class="text-[11px] bg-gray-800 text-gray-300 px-3 py-1 rounded-lg border border-gray-600 hover:text-white transition">👥 <span id="userCountText">1</span></button>
                     
                     <div class="flex items-center gap-1.5">
@@ -158,7 +159,6 @@
                 <button onclick="copyRoomLink()" class="bg-rooms-accent/20 text-rooms-accent border border-rooms-accent/30 text-[11px] px-4 py-2 rounded-lg font-bold active:scale-95 transition">Davet Et</button>
             </div>
 
-            <!-- KULLANICI LİSTESİ PANELİ (Varsayılan olarak gizli) -->
             <div id="userListPanel" class="hidden absolute top-[115px] left-0 right-0 bg-rooms-panel border-b border-rooms-border z-30 shadow-2xl p-4 max-h-[50%] overflow-y-auto">
                 <h4 class="text-xs font-bold text-gray-400 mb-3 uppercase tracking-widest">Odadan Kişiler</h4>
                 <div id="userListContainer" class="space-y-2"></div>
@@ -179,31 +179,53 @@
         let activeVideoId = null;
         let ws = null; 
         
-        // YENİ: Kullanıcı adını tarayıcıda kalıcı tutuyoruz (Sekme/tarayıcı kapansa bile değişmez)
-        let myUsername = localStorage.getItem('rooms_username');
-        if (!myUsername) {
-            myUsername = "User-" + Math.floor(1000 + Math.random() * 9000);
-            localStorage.setItem('rooms_username', myUsername);
+        const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,24}$/;
+        let myUsername;
+        try {
+            myUsername = localStorage.getItem('rooms_username');
+        } catch (err) {
+            console.warn('Kullanıcı adı depolamadan okunamadı:', err);
+        }
+        if (!USERNAME_PATTERN.test(myUsername || '')) {
+            myUsername = `User-${Math.floor(1000 + Math.random() * 9000)}`;
+            try {
+                localStorage.setItem('rooms_username', myUsername);
+            } catch (err) {
+                console.warn('Kullanıcı adı depolamaya kaydedilemedi:', err);
+            }
         }
         
         let remoteLockUntil = 0; 
         let currentRoomId = null;
-        let currentRoomHost = null; // Yöneticinin kim olduğunu tutacağız
-        let lastKnownHostState = 1; // YENİ: Yöneticinin videoyu durdurup durdurmadığını aklımızda tutacağız
+        let currentRoomHost = null;
+        let lastKnownHostState = 1;
+        let lastDispatchedHostTime = 0;
         let selectedVideoForRoom = null;
         let isRoomPublic = true;
+        let roomCreationPending = false;
         let reconnectAttempts = 0;
         let reconnectTimer = null;
         let isHostSession = false;
 
+        let serverTimeOffset = 0;
+        let pingInterval = null;
+        let lobbyRequestId = 0;
+        let searchRequestId = 0;
+
+        const YOUTUBE_API_KEY = "AIzaSyD269hfWkPpCCuhK0ZF1qMUUQaY44JEMWE";
         const BACKEND_ORIGIN = getBackendOrigin();
         const API_BASE = BACKEND_ORIGIN;
         const WS_BASE = getWsOrigin(BACKEND_ORIGIN);
 
+        function getSyncedNow() {
+            return Date.now() + serverTimeOffset;
+        }
+
         function getBackendOrigin() {
             const host = window.location.hostname;
             const port = window.location.port;
-            const isLocalFrontend = (host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.') || host.startsWith('172.'))
+            const isPrivate172 = /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+            const isLocalFrontend = (host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.') || isPrivate172)
                 && ['5500', '5501', '5173', '3000'].includes(port);
             if (isLocalFrontend) return `${window.location.protocol}//${host}:8000`;
             return window.location.origin;
@@ -220,12 +242,29 @@
             return `${base}?room=${encodeURIComponent(roomCode)}&v=${encodeURIComponent(videoId)}`;
         }
 
+        function isValidRoomId(roomId) {
+            return typeof roomId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(roomId);
+        }
+
+        function isValidVideoId(videoId) {
+            return typeof videoId === 'string' && /^[A-Za-z0-9_-]{11}$/.test(videoId);
+        }
+
         function isHostForRoom(roomCode) {
-            return sessionStorage.getItem(`rooms_host_${roomCode}`) === '1';
+            try {
+                return sessionStorage.getItem(`rooms_host_${roomCode}`) === '1';
+            } catch (err) {
+                console.warn('Oda sahipliği tarayıcı oturumunda okunamadı:', err);
+                return false;
+            }
         }
 
         function markAsHost(roomCode) {
-            sessionStorage.setItem(`rooms_host_${roomCode}`, '1');
+            try {
+                sessionStorage.setItem(`rooms_host_${roomCode}`, '1');
+            } catch (err) {
+                console.warn('Oda sahipliği tarayıcı oturumuna kaydedilemedi:', err);
+            }
         }
 
         window.onload = () => {
@@ -233,7 +272,6 @@
             handleIncomingRoomLink();
         };
 
-        // YENİ: Mobil ve Masaüstünde sekme/tarayıcı kapanmasını anında yakalayan kesin yöntem
         window.addEventListener('pagehide', () => {
             if (ws) {
                 ws.onclose = null; 
@@ -256,7 +294,7 @@
                     const res = await fetch(`${API_BASE}/api/room/${encodeURIComponent(room)}`);
                     if (res.ok) {
                         const data = await res.json();
-                        if (data.video_id && data.video_id !== 'Bekleniyor') {
+                        if (isValidVideoId(data.video_id)) {
                             vid = data.video_id;
                         }
                     }
@@ -265,15 +303,20 @@
                 }
             }
 
-            if (!vid) {
+            if (!isValidRoomId(room) || !isValidVideoId(vid)) {
                 alert('Oda linki geçersiz veya oda henüz hazır değil. Lütfen ev sahibinden yeni link isteyin.');
                 goToLobby();
                 return;
             }
 
             const isHost = isHostForRoom(room);
-            
-            // YENİ: Tarayıcının "otomatik oynatma" engelini aşmak için Lider dahil HERKES bu butona basmak zorunda!
+            showJoinOverlay(room, vid, isHost);
+        }
+
+        function showJoinOverlay(room, vid, isHost) {
+            const existing = document.getElementById('joinOverlay');
+            if (existing) existing.remove();
+
             const overlay = document.createElement('div');
             overlay.id = 'joinOverlay';
             overlay.className = 'fixed inset-0 z-[100] bg-rooms-bg/95 backdrop-blur-md flex flex-col items-center justify-center text-white';
@@ -284,11 +327,12 @@
                     </div>
                     <h2 class="text-xl font-black mb-2">Odaya Katıl</h2>
                     <p class="text-sm text-gray-400 mb-8">Senkronize izlemeye başlamak için hazır mısın?</p>
-                    <button onclick="joinRoomUI('${room}', '${vid}', ${isHost});" class="w-full bg-rooms-accent text-white px-6 py-4 rounded-xl font-bold text-lg active:scale-95 transition shadow-lg shadow-blue-500/20"> class="w-full bg-rooms-accent text-white px-6 py-4 rounded-xl font-bold text-lg active:scale-95 transition shadow-lg shadow-blue-500/20">
+                    <button class="w-full bg-rooms-accent text-white px-6 py-4 rounded-xl font-bold text-lg active:scale-95 transition shadow-lg shadow-blue-500/20">
                         Katıl ve İzlemeye Başla
                     </button>
                 </div>
             `;
+            overlay.querySelector('button').addEventListener('click', () => joinRoomUI(room, vid, isHost));
             document.body.appendChild(overlay);
         }
 
@@ -303,87 +347,126 @@
             showScreen('lobbyScreen');
             window.history.pushState({}, '', window.location.pathname);
             refreshLobby(); 
-            // YENİ: Sunucunun bağlantıyı tamamen koparıp odayı silmesi internet hızına göre uzayabilir.
-            // O yüzden peş peşe tarama yapıp o hayalet odayı zorla lobi ekranından siliyoruz.
             setTimeout(refreshLobby, 500); 
             setTimeout(refreshLobby, 1500); 
             setTimeout(refreshLobby, 3000); 
         }
 
+        function showSearchPrompt() {
+            document.getElementById('searchResults').innerHTML = `
+                <div class="h-full flex flex-col items-center justify-center text-gray-500 space-y-4 opacity-50">
+                    <svg class="w-16 h-16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                    <p class="text-sm font-medium">Başlamak için arama yapın veya link yapıştırın</p>
+                </div>
+            `;
+        }
+
         function goToSearch() {
+            searchRequestId += 1;
             showScreen('searchScreen');
+            document.getElementById('youtubeSearchInput').value = "";
+            showSearchPrompt();
             document.getElementById('youtubeSearchInput').focus();
         }
 
         function refreshLobby() {
+            const requestId = ++lobbyRequestId;
             fetch(`${API_BASE}/api/rooms`)
-                .then(res => res.json())
+                .then(res => {
+                    if (!res.ok) throw new Error(`Lobi isteği başarısız: HTTP ${res.status}`);
+                    return res.json();
+                })
                 .then(data => {
+                    if (requestId !== lobbyRequestId) return;
                     const container = document.getElementById('publicRoomsContainer');
-                    container.innerHTML = "";
-                    if(!data.active_rooms || data.active_rooms.length === 0) {
-                        container.innerHTML = `<div class="text-sm text-gray-500 text-center py-8 bg-rooms-panel rounded-2xl border border-rooms-border">Şu an aktif public oda yok.<br>İlk lobi odasını sen kur!</div>`;
+                    container.replaceChildren();
+                    if (!Array.isArray(data.active_rooms) || data.active_rooms.length === 0) {
+                        const emptyMessage = document.createElement('div');
+                        emptyMessage.className = 'text-sm text-gray-500 text-center py-8 bg-rooms-panel rounded-2xl border border-rooms-border';
+                        emptyMessage.append('Şu an aktif public oda yok.', document.createElement('br'), 'İlk lobi odasını sen kur!');
+                        container.appendChild(emptyMessage);
                         return;
                     }
                     data.active_rooms.forEach(room => {
-                        container.innerHTML += `
-                            <div onclick="joinRoom('${room.room_id}', '${room.video_id}')" class="flex items-center gap-4 p-3 bg-rooms-panel border border-rooms-border rounded-2xl hover:border-rooms-accent transition active:scale-[0.99] cursor-pointer">
-                                <div class="w-16 h-10 bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] font-mono text-gray-500 relative">
-                                    <img src="https://img.youtube.com/vi/${room.video_id}/mqdefault.jpg" class="w-full h-full object-cover">
-                                </div>
-                                <div class="flex-1 min-w-0">
-                                    <p class="text-xs font-bold text-white truncate">${room.host} Odası</p>
-                                    <p class="text-[10px] text-gray-400 mt-0.5">Katılmak için dokun</p>
-                                </div>
-                                <div class="text-right">
-                                    <span class="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 rounded-full font-bold">👤 ${room.users_count}</span>
-                                </div>
-                            </div>
-                        `;
+                        if (!room || !isValidRoomId(String(room.room_id)) || !isValidVideoId(room.video_id)) return;
+
+                        const card = document.createElement('button');
+                        card.type = 'button';
+                        card.className = 'w-full text-left flex items-center gap-4 p-3 bg-rooms-panel border border-rooms-border rounded-2xl hover:border-rooms-accent transition active:scale-[0.99] cursor-pointer';
+                        card.addEventListener('click', () => joinRoom(String(room.room_id), room.video_id));
+
+                        const thumbnail = document.createElement('span');
+                        thumbnail.className = 'w-16 h-10 bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] font-mono text-gray-500 relative';
+                        const image = document.createElement('img');
+                        image.src = `https://img.youtube.com/vi/${room.video_id}/mqdefault.jpg`;
+                        image.alt = '';
+                        image.className = 'w-full h-full object-cover';
+                        thumbnail.appendChild(image);
+
+                        const details = document.createElement('span');
+                        details.className = 'flex-1 min-w-0';
+                        const host = document.createElement('span');
+                        host.className = 'text-xs font-bold text-white truncate';
+                        host.textContent = `${typeof room.host === 'string' ? room.host : 'Bilinmeyen'} Odası`;
+                        const invitation = document.createElement('span');
+                        invitation.className = 'text-[10px] text-gray-400 mt-0.5';
+                        invitation.textContent = 'Katılmak için dokun';
+                        details.append(host, invitation);
+
+                        const count = document.createElement('span');
+                        count.className = 'text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 rounded-full font-bold';
+                        const usersCount = Number(room.users_count);
+                        count.textContent = `👤 ${Number.isFinite(usersCount) && usersCount >= 0 ? usersCount : 0}`;
+                        const countWrapper = document.createElement('span');
+                        countWrapper.className = 'text-right';
+                        countWrapper.appendChild(count);
+
+                        card.append(thumbnail, details, countWrapper);
+                        container.appendChild(card);
                     });
-                }).catch(err => console.error("Lobi yükleme hatası:", err));
+                    if (!container.childElementCount) {
+                        const emptyMessage = document.createElement('div');
+                        emptyMessage.className = 'text-sm text-gray-500 text-center py-8 bg-rooms-panel rounded-2xl border border-rooms-border';
+                        emptyMessage.textContent = 'Gösterilebilecek geçerli bir açık oda yok.';
+                        container.appendChild(emptyMessage);
+                    }
+                }).catch(err => {
+                    if (requestId !== lobbyRequestId) return;
+                    console.error("Lobi yükleme hatası:", err);
+                    const container = document.getElementById('publicRoomsContainer');
+                    container.textContent = 'Odalar yüklenemedi. Lütfen tekrar deneyin.';
+                });
         }
+
         function joinRoomUI(roomId, videoId, isHost) {
             const overlay = document.getElementById('joinOverlay');
             if(overlay) overlay.remove();
-            
             setupRoomLayout(roomId, videoId, isHost);
-            // Erken sinyal kodu buradan tamamen silindi, çünkü YouTube henüz hazır değil!
         }
+
         function joinRoom(roomId, videoId) {
+            if (!isValidRoomId(String(roomId)) || !isValidVideoId(videoId)) {
+                console.error('Geçersiz oda veya video kimliği.');
+                return;
+            }
             const newStateUrl = buildRoomUrl(roomId, videoId);
             window.history.pushState({}, '', newStateUrl);
-            
             const isHost = isHostForRoom(roomId);
-            
-            // YENİ: Lobiden tıklayanlar için de Katıl ekranını zorunlu kılıyoruz
-            const overlay = document.createElement('div');
-            overlay.id = 'joinOverlay';
-            overlay.className = 'fixed inset-0 z-[100] bg-rooms-bg/95 backdrop-blur-md flex flex-col items-center justify-center text-white';
-            overlay.innerHTML = `
-                <div class="bg-rooms-panel p-8 rounded-3xl border border-rooms-border text-center max-w-sm mx-4 shadow-2xl">
-                    <div class="w-20 h-20 bg-rooms-accent/20 rounded-full flex items-center justify-center mx-auto mb-6">
-                        <span class="text-4xl">🍿</span>
-                    </div>
-                    <h2 class="text-xl font-black mb-2">Odaya Katıl</h2>
-                    <p class="text-sm text-gray-400 mb-8">Senkronize izlemeye başlamak için hazır mısın?</p>
-                    <button onclick="joinRoomUI('${roomId}', '${videoId}', ${isHost});" class="w-full bg-rooms-accent text-white px-6 py-4 rounded-xl font-bold text-lg active:scale-95 transition shadow-lg shadow-blue-500/20"> class="w-full bg-rooms-accent text-white px-6 py-4 rounded-xl font-bold text-lg active:scale-95 transition shadow-lg shadow-blue-500/20">
-                        Katıl ve İzlemeye Başla
-                    </button>
-                </div>
-            `;
-            document.body.appendChild(overlay);
+            showJoinOverlay(roomId, videoId, isHost);
         }
 
         function exitRoom() {
             if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
             reconnectAttempts = 0;
             isHostSession = false;
+            roomCreationPending = false;
             currentRoomId = null;
+            currentRoomHost = null;
 
             if (ws) {
                 ws.onclose = null; 
-                ws.close(); // Bağlantıyı anında koparır, sunucu anında haberdar olur
+                ws.close();
                 ws = null;
             }
             
@@ -400,63 +483,107 @@
 
         function handleSearchEnter(e) { if(e.key === 'Enter') performSearch(); }
 
+        function extractVideoID(url) {
+            try {
+                const normalizedUrl = /^(?:www\.)?(?:youtube\.com|youtu\.be|m\.youtube\.com|youtube-nocookie\.com)\//i.test(url)
+                    ? `https://${url}`
+                    : url;
+                const parsedUrl = new URL(normalizedUrl, window.location.origin);
+                const host = parsedUrl.hostname.toLowerCase().replace(/^www\./, '');
+                let videoId = null;
+
+                if (host === 'youtu.be') {
+                    videoId = parsedUrl.pathname.split('/').filter(Boolean)[0];
+                } else if (['youtube.com', 'm.youtube.com', 'youtube-nocookie.com'].includes(host)) {
+                    if (parsedUrl.pathname === '/watch') {
+                        videoId = parsedUrl.searchParams.get('v');
+                    } else {
+                        const match = parsedUrl.pathname.match(/^\/(?:embed|shorts|live)\/([^/]+)/);
+                        videoId = match && match[1];
+                    }
+                }
+
+                return isValidVideoId(videoId) ? videoId : null;
+            } catch {
+                return null;
+            }
+        }
+
         function performSearch() {
             const query = document.getElementById('youtubeSearchInput').value.trim();
             const resultsDiv = document.getElementById('searchResults');
+            const requestId = ++searchRequestId;
             
-            if(!query) return;
+            if(!query) {
+                showSearchPrompt();
+                return;
+            }
 
             const videoIdFromLink = extractVideoID(query);
-            resultsDiv.innerHTML = `<div class="text-center py-4 text-gray-400 text-sm animate-pulse">YouTube'da aranıyor...</div>`;
-            
             if(videoIdFromLink) {
-                setTimeout(() => {
-                    renderVideoResult(videoIdFromLink, "Özel Linkten Gelen Video", "Bilinmeyen Kanal");
-                }, 500);
-            } else {
-                const API_KEY = "AIzaSyD269hfWkPpCCuhK0ZF1qMUUQaY44JEMWE"; 
-                const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=15&q=${encodeURIComponent(query)}&type=video&key=${API_KEY}`;
-
-                fetch(url)
-                    .then(response => response.json())
-                    .then(data => {
-                        resultsDiv.innerHTML = "";
-                        if(data.items && data.items.length > 0) {
-                            data.items.forEach(item => {
-                                if(item.id.videoId) {
-                                    renderVideoResult(item.id.videoId, item.snippet.title, item.snippet.channelTitle);
-                                }
-                            });
-                        } else {
-                            resultsDiv.innerHTML = `<div class="text-center py-4 text-gray-400 text-sm">Sonuç bulunamadı.</div>`;
-                        }
-                    })
-                    .catch(err => {
-                        console.error("YouTube API Hatası:", err);
-                        resultsDiv.innerHTML = `<div class="text-center py-4 text-red-500 text-sm">Arama yapılırken bir hata oluştu. Anahtarı kontrol edin.</div>`;
-                    });
+                showSearchPrompt();
+                openSetupModal(videoIdFromLink, "Özel Linkten Gelen Video");
+                return;
             }
+
+            resultsDiv.innerHTML = `<div class="text-center py-4 text-gray-400 text-sm animate-pulse">YouTube'da aranıyor...</div>`;
+
+            const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=15&q=${encodeURIComponent(query)}&type=video&key=${YOUTUBE_API_KEY}`;
+
+            fetch(url)
+                .then(response => {
+                    if (!response.ok) throw new Error(`YouTube araması başarısız: HTTP ${response.status}`);
+                    return response.json();
+                })
+                .then(data => {
+                    if (requestId !== searchRequestId) return;
+                    resultsDiv.innerHTML = "";
+                    let resultCount = 0;
+                    if(Array.isArray(data.items)) {
+                        data.items.forEach(item => {
+                            if(item && item.id && isValidVideoId(item.id.videoId) && item.snippet) {
+                                renderVideoResult(item.id.videoId, item.snippet.title, item.snippet.channelTitle);
+                                resultCount += 1;
+                            }
+                        });
+                    }
+                    if (!resultCount) {
+                        resultsDiv.innerHTML = `<div class="text-center py-8 text-gray-400 text-sm">Sonuç bulunamadı.</div>`;
+                    }
+                })
+                .catch(err => {
+                    if (requestId !== searchRequestId) return;
+                    console.error("YouTube API Hatası:", err);
+                    resultsDiv.innerHTML = `<div class="text-center py-8 text-red-500 text-sm">Arama yapılırken bir hata oluştu.</div>`;
+                });
         }
 
         function renderVideoResult(videoId, title, channel) {
             const resultsDiv = document.getElementById('searchResults');
-            if(resultsDiv.innerHTML.includes("aranıyor...")) resultsDiv.innerHTML = ""; 
+            if (!isValidVideoId(videoId)) return;
 
-            resultsDiv.innerHTML += `
-                <div onclick="openSetupModal('${videoId}', '${title.replace(/'/g, "\\'")}')" class="flex gap-3 p-3 bg-rooms-panel border border-rooms-border rounded-xl active:scale-[0.98] transition cursor-pointer hover:border-rooms-accent">
-                    <img src="https://img.youtube.com/vi/${videoId}/mqdefault.jpg" class="w-32 h-20 object-cover rounded-lg bg-black">
-                    <div class="flex-1 min-w-0 py-1">
-                        <h4 class="text-sm font-bold text-gray-100 leading-tight line-clamp-2">${title}</h4>
-                        <p class="text-[11px] text-gray-400 mt-2">${channel}</p>
-                    </div>
-                </div>
-            `;
-        }
+            const card = document.createElement('button');
+            card.type = 'button';
+            card.className = 'w-full text-left flex gap-3 p-3 bg-rooms-panel border border-rooms-border rounded-xl active:scale-[0.98] transition cursor-pointer hover:border-rooms-accent';
+            card.addEventListener('click', () => openSetupModal(videoId, typeof title === 'string' ? title : 'YouTube videosu'));
 
-        function extractVideoID(url) {
-            const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
-            const match = url.match(regExp);
-            return (match && match[2].length === 11) ? match[2] : null;
+            const image = document.createElement('img');
+            image.src = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
+            image.alt = '';
+            image.className = 'w-32 h-20 object-cover rounded-lg bg-black';
+
+            const details = document.createElement('span');
+            details.className = 'flex-1 min-w-0 py-1';
+            const titleElement = document.createElement('span');
+            titleElement.className = 'text-sm font-bold text-gray-100 leading-tight line-clamp-2';
+            titleElement.textContent = typeof title === 'string' ? title : 'YouTube videosu';
+            const channelElement = document.createElement('span');
+            channelElement.className = 'text-[11px] text-gray-400 mt-2';
+            channelElement.textContent = typeof channel === 'string' ? channel : '';
+            details.append(titleElement, channelElement);
+
+            card.append(image, details);
+            resultsDiv.appendChild(card);
         }
 
         function openSetupModal(videoId, title) {
@@ -490,17 +617,32 @@
         }
 
         function finalizeRoomCreation() {
+            if (!isValidVideoId(selectedVideoForRoom)) {
+                alert('Oda oluşturmak için önce geçerli bir YouTube videosu seçin.');
+                return;
+            }
             closeSetupModal();
-            const newRoomCode = Math.floor(1000 + Math.random() * 9000);
+            const newRoomCode = Array.from(
+                crypto.getRandomValues(new Uint8Array(12)),
+                byte => byte.toString(16).padStart(2, '0')
+            ).join('');
             markAsHost(newRoomCode);
+            roomCreationPending = true;
             const newStateUrl = buildRoomUrl(newRoomCode, selectedVideoForRoom);
             window.history.pushState({}, '', newStateUrl);
             setupRoomLayout(newRoomCode, selectedVideoForRoom, true); 
         }
 
         function setupRoomLayout(roomCode, videoId, isHost) {
+            if (!isValidRoomId(String(roomCode)) || !isValidVideoId(videoId)) {
+                alert('Oda bağlantısı geçersiz.');
+                goToLobby();
+                return;
+            }
+
             activeVideoId = videoId;
             currentRoomId = roomCode;
+            currentRoomHost = null;
             isHostSession = isHost;
             showScreen('roomScreen');
             
@@ -522,18 +664,14 @@
             if (activeVideoId && !player) loadYouTubePlayer(activeVideoId);
         }
 
-        function loadYouTubePlayer(vid){
+        function loadYouTubePlayer(vid) {
             player = new YT.Player('player', {
                 height: '100%', width: '100%', videoId: vid,
                 playerVars: { 'playsinline': 1, 'rel': 0, 'controls': 1, 'origin': window.location.origin }, 
                 events: { 
                     'onReady': () => {
-                        // YENİ: YouTube Oynatıcı tam olarak ekrana yüklendiğinde kilidi başlat!
-                        // Liderin 0:00'ı herkese yaymaması için 5 saniye boyunca kendisini susturuyoruz.
-                        remoteLockUntil = Date.now() + 5000; 
-                        
+                        remoteLockUntil = Date.now() + 1500;
                         if (ws && ws.readyState === WebSocket.OPEN) {
-                            // Şimdi güvenle odadakilerden gerçek saniyeyi isteyebiliriz
                             ws.send(JSON.stringify({ type: 'request_sync', sender: myUsername }));
                         }
                     },
@@ -542,44 +680,80 @@
             });
         }
 
-        function onPlayerStateChange(event) {
-            if(!ws || ws.readyState !== WebSocket.OPEN) return;
+        function applyRemoteSync(state, remoteTime, sentAt, isRadarCheck = false) {
+            if (!player || typeof player.seekTo !== 'function' || typeof player.getCurrentTime !== 'function'
+                || ![1, 2].includes(state) || !Number.isFinite(remoteTime) || remoteTime < 0) return;
+            const transitDelay = Number.isFinite(sentAt)
+                ? Math.max(0, Math.min(1.5, (getSyncedNow() - sentAt) / 1000))
+                : 0.05;
+            const targetTime = (state === 1) ? (remoteTime + transitDelay) : remoteTime;
+            const myTime = player.getCurrentTime();
+            const timeDiff = Math.abs(myTime - targetTime);
+            const myState = player.getPlayerState();
 
-            // EĞER KİŞİ YÖNETİCİ DEĞİLSE
-            if (currentRoomHost !== myUsername) {
-                // Eğer sunucudan emir gelmemişse (kendi eliyle videoya dokunmuşsa)
-                if (Date.now() >= remoteLockUntil) {
-                    // Yönetici videoyu oynatıyorsa ve misafir durdurmaya kalkarsa, zorla geri başlat
-                    if (event.data === 2 && lastKnownHostState === 1) {
-                        player.playVideo();
-                    } 
-                    // Yönetici videoyu durdurmuşsa ve misafir başlatmaya kalkarsa, zorla geri durdur
-                    else if (event.data === 1 && lastKnownHostState === 2) {
-                        player.pauseVideo();
-                    }
+            lastKnownHostState = state;
+            remoteLockUntil = Date.now() + 800;
+
+            if (state === 2) {
+                if (myState !== 2) player.pauseVideo();
+                if (timeDiff > 0.15) {
+                    player.seekTo(targetTime, true);
                 }
-                return; // Yönetici olmadığı için asla sunucuya sync emri gönderme
+            } else if (state === 1) {
+                if (timeDiff > 0.3) {
+                    player.seekTo(targetTime + 0.04, true);
+                }
+                if (myState !== 1) {
+                    player.playVideo();
+                }
+            }
+        }
+
+        function sendHostSync(state) {
+            if (!ws || ws.readyState !== WebSocket.OPEN || !player || typeof player.getCurrentTime !== 'function') return;
+            const currentTime = player.getCurrentTime();
+            lastKnownHostState = state;
+            lastDispatchedHostTime = currentTime;
+            ws.send(JSON.stringify({
+                type: 'sync',
+                state: state,
+                time: currentTime,
+                sent_at: getSyncedNow(),
+                sender: myUsername
+            }));
+        }
+
+        function onPlayerStateChange(event) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            if (currentRoomHost !== myUsername) {
+                if (event.data === 2 && lastKnownHostState === 1) {
+                    remoteLockUntil = Date.now() + 600;
+                    player.playVideo();
+                } else if (event.data === 1 && lastKnownHostState === 2) {
+                    remoteLockUntil = Date.now() + 600;
+                    player.pauseVideo();
+                }
+                return;
             }
 
-            // YÖNETİCİ İSE
             if (Date.now() < remoteLockUntil) return;
-            if(event.data == 1 || event.data == 2) {
-                lastKnownHostState = event.data; // Yönetici kendi durumunu günceller
-                ws.send(JSON.stringify({ type: 'sync', state: event.data, time: player.getCurrentTime(), sender: myUsername }));
+            if (event.data === 1 || event.data === 2) {
+                sendHostSync(event.data);
+            }
+        }
+
+        function sendPing() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping', client_time: Date.now() }));
             }
         }
 
         function connectToPython(roomId, isHost) {
-            if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-                reconnectTimer = null;
-            }
-            if (ws) {
-                ws.onclose = null;
-                ws.close();
-            }
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+            if (ws) { ws.onclose = null; ws.close(); }
 
-            // Artık url'ye myUsername de ekliyoruz
             const wsUrl = `${WS_BASE}/ws/${encodeURIComponent(roomId)}/${encodeURIComponent(myUsername)}`;
             ws = new WebSocket(wsUrl);
 
@@ -588,14 +762,17 @@
                 document.getElementById('connectionDot').className = 'w-2 h-2 rounded-full bg-emerald-500';
                 document.getElementById('connectionStatus').innerText = "Bağlı";
                 
-                if (isHost) {
+                sendPing();
+                pingInterval = setInterval(sendPing, 5000);
+
+                if (isHost && roomCreationPending) {
                     ws.send(JSON.stringify({
                         type: 'room_update',
                         video_id: activeVideoId,
                         is_public: isRoomPublic
                     }));
+                    roomCreationPending = false;
                 } else {
-                    // Bağlantı kurulduğunda oynatıcı çoktan hazırsa süreyi hemen iste
                     if (player && typeof player.seekTo === 'function') {
                         ws.send(JSON.stringify({ type: 'request_sync', sender: myUsername }));
                     }
@@ -610,79 +787,80 @@
             };
 
             ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
+                let data;
+                try {
+                    data = JSON.parse(event.data);
+                } catch (err) {
+                    console.error('Geçersiz WebSocket mesajı alındı:', err);
+                    return;
+                }
+                if (!data || typeof data !== 'object' || typeof data.type !== 'string') return;
                 
-                if (data.type === 'chat') {
+                if (data.type === 'pong') {
+                    if (!Number.isFinite(data.client_time) || !Number.isFinite(data.server_time)) return;
+                    const now = Date.now();
+                    const rtt = now - data.client_time;
+                    const oneWay = rtt / 2;
+                    serverTimeOffset = data.server_time - (now - oneWay);
+                }
+                else if (data.type === 'chat') {
+                    if (typeof data.sender !== 'string' || typeof data.text !== 'string') return;
                     const isMe = data.sender === myUsername;
                     const color = data.color || (isMe ? "text-rooms-accent font-bold" : "text-gray-300 font-bold");
                     addChatMessage(data.sender, data.text, color);
                 } 
                 else if (data.type === 'sync' && data.sender !== myUsername) {
-                    if (!player || typeof player.seekTo !== 'function') return;
-                    remoteLockUntil = Date.now() + 3000; 
-                    lastKnownHostState = data.state; // YENİ EKLENDİ
-                    player.seekTo(data.time, true);
-                    if(data.state == 1) { 
-                        player.playVideo();
-                    } else if(data.state == 2) { 
-                        player.pauseVideo();
-                    }
+                    if (!Number.isFinite(data.sent_at)) data.sent_at = null;
+                    applyRemoteSync(data.state, data.time, data.sent_at, false);
                 }
-                // ATILMA DURUMU
                 else if (data.type === 'kicked') {
                     alert("Oda yöneticisi tarafından odadan çıkarıldınız.");
                     exitRoom();
                 }
-                // EĞER BİRİ SÜREYİ SORARSA (Yeni giren biri veya düşüp geri dönen lider)
                 else if (data.type === 'request_sync' && data.sender !== myUsername) {
                     if (player && typeof player.getCurrentTime === 'function') {
                         let currentState = player.getPlayerState();
-                        if (currentState === 1 || currentState === 2) {
-                            // Eğer ben lidersem DOĞRUDAN cevap veririm.
-                            // VEYA soruyu soran kişi asıl liderse (yani lider düşüp geri gelmişse), misafir olsam bile nerede kaldığımızı ona ben söylerim!
-                            if (currentRoomHost === myUsername || currentRoomHost === data.sender) {
-                                ws.send(JSON.stringify({ type: 'sync', state: currentState, time: player.getCurrentTime(), sender: myUsername }));
-                            }
+                        if (currentState !== 1 && currentState !== 2) currentState = 1;
+                        if (currentRoomHost === myUsername || currentRoomHost === data.sender) {
+                            ws.send(JSON.stringify({
+                                type: 'sync',
+                                state: currentState,
+                                time: player.getCurrentTime(),
+                                sent_at: getSyncedNow(),
+                                sender: myUsername
+                            }));
                         }
                     }
                 }
-                // YENİ: Asıl lider geri geldiğinde, geçici liderin güncel süreyi asıl lidere aktarması
                 else if (data.type === 'force_sync_request') {
-                    // Eğer ben az önceki geçici lidersem, süreyi yayınlayayım ki asıl lider nerede kaldığımızı bilsin
                     if (myUsername === data.target && player && typeof player.getCurrentTime === 'function') {
                         let currentState = player.getPlayerState();
-                        if (currentState === 1 || currentState === 2) {
-                            ws.send(JSON.stringify({ type: 'sync', state: currentState, time: player.getCurrentTime(), sender: myUsername }));
-                        }
+                        if (currentState !== 1 && currentState !== 2) currentState = 1;
+                        ws.send(JSON.stringify({
+                            type: 'sync',
+                            state: currentState,
+                            time: player.getCurrentTime(),
+                            sent_at: getSyncedNow(),
+                            sender: myUsername
+                        }));
                     }
                 }
-                
-                // YENİ: Yöneticiden gelen radar sinyalini yakala ve gerekirse süreyi eşitle
                 else if (data.type === 'sync_check' && data.sender !== myUsername) {
-                    if (!player || typeof player.getCurrentTime !== 'function') return;
-                    
-                    // Sadece misafirsek bu işlemi yap
                     if (currentRoomHost !== myUsername) {
-                        let myTime = player.getCurrentTime();
-                        let timeDiff = Math.abs(myTime - data.time);
-                        
-                        // Eğer aramızdaki fark 2 saniyeden fazlaysa (gecikme veya donma yaşanmışsa)
-                        if (timeDiff > 2) {
-                            remoteLockUntil = Date.now() + 1000;
-                            player.seekTo(data.time, true); // Yöneticinin saniyesine zıpla
-                        }
+                        applyRemoteSync(data.state, data.time, data.sent_at, true);
                     }
                 }
-                // KULLANICI LİSTESİ VE YÖNETİCİ GÜNCELLEMESİ
                 else if (data.type === 'user_list') {
+                    if (typeof data.host !== 'string' || !Array.isArray(data.users)
+                        || !data.users.every(user => typeof user === 'string')) return;
                     currentRoomHost = data.host;
                     document.getElementById('userCountText').innerText = data.users.length;
                     updateUserListUI(data.users, data.host);
-                    // Kalkan aktif/pasif etme kodları buradan tamamen silindi!
                 }
             };
 
             ws.onclose = () => {
+                if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
                 document.getElementById('connectionDot').className = 'w-2 h-2 rounded-full bg-red-500 animate-pulse';
                 document.getElementById('connectionStatus').innerText = "Yeniden bağlanıyor...";
 
@@ -694,7 +872,6 @@
             };
         }
 
-        // YENİ UI FONKSİYONLARI: KULLANICILAR VE YÖNETİM
         function toggleUserList() {
             const panel = document.getElementById('userListPanel');
             panel.classList.toggle('hidden');
@@ -702,42 +879,52 @@
 
         function updateUserListUI(users, host) {
             const container = document.getElementById('userListContainer');
-            container.innerHTML = "";
+            container.replaceChildren();
             const iAmHost = (myUsername === host);
 
             users.forEach(u => {
                 const isMe = (u === myUsername);
                 const isUserHost = (u === host);
-                
-                let actionsHtml = "";
-                if (iAmHost && !isMe) {
-                    actionsHtml = `
-                        <div class="flex gap-2">
-                            <button onclick="transferHost('${u}')" class="px-2 py-1 bg-blue-500/20 text-blue-400 rounded text-[10px] border border-blue-500/30 hover:bg-blue-500/40">👑 Devret</button>
-                            <button onclick="kickUser('${u}')" class="px-2 py-1 bg-red-500/20 text-red-400 rounded text-[10px] border border-red-500/30 hover:bg-red-500/40">At</button>
-                        </div>
-                    `;
-                }
 
-                container.innerHTML += `
-                    <div class="flex justify-between items-center p-2 rounded-lg bg-rooms-bg border border-rooms-border">
-                        <span class="text-xs text-gray-200">
-                            ${isUserHost ? '👑 ' : ''}${u} ${isMe ? '<span class="text-gray-500">(Sen)</span>' : ''}
-                        </span>
-                        ${actionsHtml}
-                    </div>
-                `;
+                const row = document.createElement('div');
+                row.className = 'flex justify-between items-center p-2 rounded-lg bg-rooms-bg border border-rooms-border';
+                const userLabel = document.createElement('span');
+                userLabel.className = 'text-xs text-gray-200';
+                userLabel.textContent = `${isUserHost ? '👑 ' : ''}${u}`;
+                if (isMe) {
+                    const selfLabel = document.createElement('span');
+                    selfLabel.className = 'text-gray-500';
+                    selfLabel.textContent = ' (Sen)';
+                    userLabel.appendChild(selfLabel);
+                }
+                row.appendChild(userLabel);
+
+                if (iAmHost && !isMe) {
+                    const actions = document.createElement('div');
+                    actions.className = 'flex gap-2';
+                    const transferButton = document.createElement('button');
+                    transferButton.className = 'px-2 py-1 bg-blue-500/20 text-blue-400 rounded text-[10px] border border-blue-500/30 hover:bg-blue-500/40';
+                    transferButton.textContent = '👑 Devret';
+                    transferButton.addEventListener('click', () => transferHost(u));
+                    const kickButton = document.createElement('button');
+                    kickButton.className = 'px-2 py-1 bg-red-500/20 text-red-400 rounded text-[10px] border border-red-500/30 hover:bg-red-500/40';
+                    kickButton.textContent = 'At';
+                    kickButton.addEventListener('click', () => kickUser(u));
+                    actions.append(transferButton, kickButton);
+                    row.appendChild(actions);
+                }
+                container.appendChild(row);
             });
         }
 
         function kickUser(targetUsername) {
-            if (confirm(`${targetUsername} adlı kullanıcıyı odadan atmak istiyor musun?`)) {
+            if (ws && ws.readyState === WebSocket.OPEN && confirm(`${targetUsername} adlı kullanıcıyı odadan atmak istiyor musun?`)) {
                 ws.send(JSON.stringify({ type: 'kick', target: targetUsername }));
             }
         }
 
         function transferHost(targetUsername) {
-            if (confirm(`Oda yöneticiliğini ${targetUsername} adlı kişiye devretmek istiyor musun? Artık videoyu sen yönetemeyeceksin.`)) {
+            if (ws && ws.readyState === WebSocket.OPEN && confirm(`Oda yöneticiliğini ${targetUsername} adlı kişiye devretmek istiyor musun? Artık videoyu sen yönetemeyeceksin.`)) {
                 ws.send(JSON.stringify({ type: 'transfer_host', target: targetUsername }));
             }
         }
@@ -754,38 +941,77 @@
 
         function addChatMessage(sender, text, colorClass) {
             const box = document.getElementById('chatMessages');
-            box.innerHTML += `
-                <div class="bg-rooms-bg/40 p-2.5 rounded-xl border border-rooms-border/50">
-                    <span class="${colorClass}">[${sender}]</span>
-                    <span class="text-gray-200 ml-1">${text}</span>
-                </div>
-            `;
+            const allowedColors = ['text-rooms-accent', 'text-gray-300', 'text-emerald-400', 'text-amber-500', 'text-gray-500'];
+            const safeColor = allowedColors.find(color => typeof colorClass === 'string' && colorClass.split(/\s+/).includes(color))
+                || (sender === myUsername ? 'text-rooms-accent' : 'text-gray-300');
+            const message = document.createElement('div');
+            message.className = 'bg-rooms-bg/40 p-2.5 rounded-xl border border-rooms-border/50';
+            const senderLabel = document.createElement('span');
+            senderLabel.className = `${safeColor} font-bold`;
+            senderLabel.textContent = `[${sender}]`;
+            const messageText = document.createElement('span');
+            messageText.className = 'text-gray-200 ml-1';
+            messageText.textContent = text;
+            message.append(senderLabel, messageText);
+            box.appendChild(message);
+            while (box.childElementCount > 200) box.firstElementChild.remove();
             box.scrollTop = box.scrollHeight;
         }
 
-        function copyRoomLink() {
+        async function copyRoomLink() {
             const copyText = document.getElementById("shareUrlInput");
-            copyText.select();
-            navigator.clipboard.writeText(copyText.value);
-            alert("Davet Linki Kopyalandı! Artık istediğin kişiye gönderebilirsin.");
+            try {
+                await navigator.clipboard.writeText(copyText.value);
+                alert("Davet Linki Kopyalandı! Artık istediğin kişiye gönderebilirsin.");
+            } catch (err) {
+                console.error('Davet linki kopyalanamadı:', err);
+                copyText.select();
+                let copied = false;
+                try {
+                    copied = document.execCommand('copy');
+                } catch (fallbackError) {
+                    console.error('Kopyalama yedeği başarısız:', fallbackError);
+                }
+                if (copied) {
+                    alert("Davet Linki Kopyalandı! Artık istediğin kişiye gönderebilirsin.");
+                } else {
+                    alert("Davet linki kopyalanamadı. Linki seçip elle kopyalayabilirsiniz.");
+                }
+            }
         }
-        // YENİ: Yöneticinin her 2 saniyede bir süresini yayınladığı radar sistemi
+
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js')
+                    .catch(err => console.error('Service worker kaydedilemedi:', err));
+            });
+        }
+
         setInterval(() => {
             if (ws && ws.readyState === WebSocket.OPEN) {
-                // Sadece yöneticiysek ve video o an oynatılıyorsa bu sinyali gönder
                 if (currentRoomHost === myUsername && player && typeof player.getCurrentTime === 'function') {
-                    if (Date.now() < remoteLockUntil) return; // YENİ: Lider odaya ilk girdiğinde, asıl süreyi öğrenene kadar radarın 0:00 göndermesini engeller!
-                    
-                    if (player.getPlayerState() === 1) { 
+                    if (Date.now() < remoteLockUntil) return;
+
+                    const currentState = player.getPlayerState();
+                    const currentTime = player.getCurrentTime();
+
+                    if (currentState === 1) {
+                        lastDispatchedHostTime = currentTime;
                         ws.send(JSON.stringify({ 
                             type: 'sync_check', 
-                            time: player.getCurrentTime(), 
+                            state: 1,
+                            time: currentTime,
+                            sent_at: getSyncedNow(),
                             sender: myUsername 
                         }));
+                    } else if (currentState === 2) {
+                        if (Math.abs(currentTime - lastDispatchedHostTime) > 0.5) {
+                            sendHostSync(2);
+                        }
                     }
                 }
             }
-        }, 2000);
+        }, 1000);
     </script>
 </body>
 </html>
