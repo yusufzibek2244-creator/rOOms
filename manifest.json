@@ -1,7 +1,11 @@
 {
   "name": "rOOms Watch Party",
   "short_name": "rOOms",
+  "description": "Arkadaşlarınızla senkronize YouTube izleme odaları.",
+  "lang": "tr",
+  "id": "/",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#121212",
   "theme_color": "#121212",
